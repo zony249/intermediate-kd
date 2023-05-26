@@ -15,12 +15,11 @@ XLA_USE_BF16 = os.environ.get("XLA_USE_BF16", "0").upper()
 XLA_DOWNCAST_BF16 = os.environ.get("XLA_DOWNCAST_BF16", "0").upper()
 ENV_VARS_TRUE_VALUES = {"1", "ON", "YES", "TRUE"}
 
-class Stage(Module): 
-    def __init__(self, layers, model="t5"):
+class T5Stage(Module): 
+    def __init__(self, layers: ModuleList):
         super().__init__()
 
         self.layers = layers  
-        self.model = model 
         self.size = len(layers)
 
     def __getitem__(self, idx):
@@ -34,22 +33,6 @@ class Stage(Module):
                 past_key_values=None,
                 cross_attn_head_mask=None):
 
-        if self.model == "t5":
-            return self.t5_forward(hidden_states, 
-                                   attention_mask=attention_mask, 
-                                   encoder_hidden_states=encoder_hidden_states, 
-                                   encoder_attention_mask=encoder_attention_mask, 
-                                   past_key_values=past_key_values, 
-                                   cross_attn_head_mask=cross_attn_head_mask)
-        
-    def t5_forward(self, 
-                   hidden_states: torch.Tensor, 
-                   attention_mask=None, 
-                   encoder_hidden_states=None, 
-                   encoder_attention_mask=None,
-                   past_key_values=None, 
-                   cross_attn_head_mask=None):
-
         present_key_values = [] 
 
         for i, layer in enumerate(self.layers):
@@ -60,12 +43,17 @@ class Stage(Module):
                 past_key_value = None
             else:
                 past_key_value = past_key_values[i]
+                if past_key_value is not None:
+                    print("HIDDEN STATES SHAPE", hidden_states.shape)
+                    print("PAST KEY VALUE:",  past_key_value[:2][0].shape)
             
             # cross attn 
             if cross_attn_head_mask is None:
                 cross_attn_layer_head_mask = None
             else:
                 cross_attn_layer_head_mask = cross_attn_head_mask[i]
+
+
 
             layer_out = layer(hidden_states, 
                               attention_mask=attention_mask, 
@@ -84,7 +72,7 @@ class Stage(Module):
 
 
 
-class StagedModel(Module):
+class T5StagedModel(Module):
     def __init__(self):
         super().__init__() 
 
@@ -99,23 +87,50 @@ class StagedModel(Module):
         self.lm = None 
 
     
-    def forward(self, input_ids):
-        pass 
-
-    def t5_forward(self, 
-                    input_ids, 
-                    target_ids=None, 
-                    attention_mask=None,
-                    encoder_hidden_states=None,
-                    decoder_attention_mask=None,
-                    cross_attn_head_mask=None,
-                    past_key_values=None, 
-                    return_dict=None, 
-                    encoder_return_groups=None, 
-                    decoder_return_groups=None):
+    def forward(self, 
+                input_ids, 
+                target_ids=None, 
+                attention_mask=None,
+                encoder_hidden_states=None,
+                decoder_attention_mask=None,
+                cross_attn_head_mask=None,
+                past_key_values=None, 
+                return_dict=None, 
+                encoder_return_groups=None, 
+                decoder_return_groups=None):
     
         assert self.pre_encoder is not None, "model not initialized, please load a model first using load_t5 (or any other model loading function)"
+        
+        enc_hidden_states, _, attention_mask = self.encoder_forward(input_ids, 
+                                                    attention_mask=attention_mask, 
+                                                    encoder_return_groups=encoder_return_groups, 
+                                                    return_attention_mask=True)
 
+        if encoder_return_groups is not None:
+            return enc_hidden_states, None
+
+        # set target_ids
+        if target_ids is None:
+           target_ids = torch.zeros((input_ids.shape[0], 1), dtype=torch.long)
+
+
+        decoder_outputs, present_key_values = self.decoder_forward(target_ids, 
+                                                                 decoder_attention_mask=decoder_attention_mask, 
+                                                                 encoder_hidden_states=enc_hidden_states, 
+                                                                 encoder_attention_mask=attention_mask,
+                                                                 past_key_values=past_key_values,
+                                                                 cross_attn_head_mask=cross_attn_head_mask, 
+                                                                 decoder_return_groups=decoder_return_groups)
+
+        return decoder_outputs, present_key_values
+
+
+    def encoder_forward(self, 
+                        input_ids,
+                        attention_mask=None, 
+                        encoder_return_groups=None, 
+                        return_attention_mask=False
+                        ):
         input_embeds = self.pre_encoder[0](input_ids)
         print(input_embeds.shape) 
 
@@ -134,17 +149,26 @@ class StagedModel(Module):
                 return enc_hidden_states, None
         enc_hidden_states = self.post_encoder(enc_hidden_states)
 
-        # set target_ids
-        if target_ids is None:
-           target_ids = torch.zeros((input_ids.shape[0], 1), dtype=torch.long)
+        if return_attention_mask:
+            return enc_hidden_states, None, attention_mask 
+        return enc_hidden_states, None
+
+    def decoder_forward(self, 
+                        target_ids,
+                        decoder_attention_mask=None,
+                        encoder_hidden_states=None,
+                        encoder_attention_mask=None,
+                        past_key_values=None,
+                        cross_attn_head_mask=None,
+                        decoder_return_groups=None):
 
         target_embeds = self.pre_decoder[0](target_ids)
+        batch_size, seq_length = target_ids.shape
 
         # decoder attention mask
-        if decoder_attention_mask is not None and target_ids is None:
-            raise ValueError("You cannot define decoder_attention_mask without defining target_ids!")
+        mask_seq_length = past_key_values[0][0].shape[2] + seq_length if past_key_values is not None else seq_length
         if decoder_attention_mask is None:
-            decoder_attention_mask = torch.ones(target_ids.shape)
+            decoder_attention_mask = torch.ones(batch_size, mask_seq_length)
 
         # shape is now [batch, None, None, seq_len]
         decoder_attention_mask = self.extend_attention_mask_dec(decoder_attention_mask, target_ids.shape) 
@@ -170,11 +194,13 @@ class StagedModel(Module):
                 cross_idx += dec_block.size
             else:
                 cross_attn_layer_head_mask = [None] * dec_block.size
+            
+            print("DECODER ATTENTION MASK SHAPE:", decoder_attention_mask.shape)
 
             dec_hidden_states, present_key_value = dec_block(dec_hidden_states, 
                                      attention_mask=decoder_attention_mask, 
-                                     encoder_hidden_states=enc_hidden_states, 
-                                     encoder_attention_mask=attention_mask, 
+                                     encoder_hidden_states=encoder_hidden_states, 
+                                     encoder_attention_mask=encoder_attention_mask, 
                                      past_key_values=past_key_value, 
                                      cross_attn_head_mask=cross_attn_layer_head_mask)
             present_key_values += present_key_value
@@ -188,8 +214,6 @@ class StagedModel(Module):
         lm_logits = self.lm(dec_hidden_states)
         print("LM LOGITS SHAPE", lm_logits.shape)
         return lm_logits, present_key_values 
-
-    
     
     def extend_attention_mask_enc(self, mask):
         """
@@ -219,6 +243,9 @@ class StagedModel(Module):
             )
 
         extended_attention_mask = causal_mask[:, None, :, :] * mask[:, None, None, :]
+        
+        extended_attention_mask = extended_attention_mask.to(dtype=self.get_dtype())  # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(self.get_dtype()).min
         return extended_attention_mask
 
     
@@ -238,7 +265,10 @@ class StagedModel(Module):
 
 
 
-    def get_dtype(self): 
+    def get_dtype(self):
+        """
+        Obtained from huggingface source code
+        """
         last_dtype = None
         for t in self.enc_key_layers[0].parameters():
             last_dtype = t.dtype
@@ -259,10 +289,10 @@ class StagedModel(Module):
 
 
     @staticmethod 
-    def load_t5(model_name: str, encoder_staging: list, decoder_staging: list) -> StagedModel:
+    def load_t5(model_name: str, encoder_staging: list, decoder_staging: list) -> T5StagedModel:
         model = T5ForConditionalGeneration.from_pretrained(model_name)
         
-        staged_model = StagedModel() 
+        staged_model = T5StagedModel() 
 
         pre_encoder = [] 
         enc_key_layers = []  
@@ -277,7 +307,7 @@ class StagedModel(Module):
         pre_encoder.append(model.encoder.embed_tokens)
         prev_staging_idx = 0
         for idx in encoder_staging:
-            enc_key_layers.append(Stage(model.encoder.block[prev_staging_idx:idx], model="t5"))
+            enc_key_layers.append(T5Stage(model.encoder.block[prev_staging_idx:idx]))
             prev_staging_idx = idx
         post_encoder.append(model.encoder.final_layer_norm)
         post_encoder.append(model.encoder.dropout)
@@ -287,7 +317,7 @@ class StagedModel(Module):
         pre_decoder.append(model.decoder.embed_tokens)
         prev_staging_idx = 0 
         for idx in decoder_staging:
-            dec_key_layers.append(Stage(model.decoder.block[prev_staging_idx:idx], model="t5"))
+            dec_key_layers.append(T5Stage(model.decoder.block[prev_staging_idx:idx]))
             prev_staging_idx = idx 
         post_decoder.append(model.decoder.final_layer_norm)
         post_decoder.append(model.decoder.dropout)
@@ -311,11 +341,11 @@ class StagedModel(Module):
 if __name__ == "__main__":
 
 
-    model = StagedModel.load_t5("t5-base", [3, 5, 7, 9, 12], [3, 5, 7, 9, 12])
+    model = T5StagedModel.load_t5("t5-base", [3, 5, 7, 9, 12], [3, 5, 7, 9, 12])
     # model = BartForConditionalGeneration.from_pretrained("facebook/bart-large-cnn")
     tok = T5Tokenizer.from_pretrained("t5-base", model_max_length=512)
     
-    tokenized = tok(["test one", "test two three", "testing one", "testing two three four"])
+    tokenized = tok(["test one", "test two three", "testing one", "testing two four"])
     input_ids = [torch.tensor(t) for t in tokenized["input_ids"]] 
     attention_mask = [torch.tensor(t) for t in tokenized["attention_mask"]]
 
@@ -329,16 +359,23 @@ if __name__ == "__main__":
     print(attention_mask_padded) 
 
 
-    _, past_key_values = model.t5_forward(input_ids=input_ids_padded, attention_mask=attention_mask_padded)
+    _, past_key_values = model(input_ids=input_ids_padded, 
+                               target_ids=input_ids_padded, 
+                               attention_mask=attention_mask_padded)
     print("PAST KEY VALUES", past_key_values[0][0].shape)
-    model.t5_forward(input_ids=input_ids_padded, attention_mask=attention_mask_padded, past_key_values=past_key_values)
+    
+    for i in range(10):
+        _, past_key_values = model(input_ids=input_ids_padded, 
+                                   target_ids=input_ids_padded, 
+                                   attention_mask=attention_mask_padded, 
+                                   past_key_values=past_key_values)
 
     
     # torch.set_printoptions(profile="short")
     # dec = T5ForConditionalGeneration.from_pretrained("t5-base").decoder
     # print(len(dec(input_ids_padded, attention_mask=attention_mask_padded)['past_key_values'][0]))
 
-    # test_stage = Stage(T5ForConditionalGeneration.from_pretrained("t5-base").encoder.block[3:6])
+    # test_stage = T5Stage(T5ForConditionalGeneration.from_pretrained("t5-base").encoder.block[3:6])
     #
     # x = torch.rand((1, 4, 768))
     # test_stage.t5_forward(x)
