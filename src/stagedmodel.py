@@ -3,7 +3,7 @@ import os
 import sys 
 
 import torch 
-from torch.nn import Module, ModuleList, Sequential 
+from torch.nn import Module, ModuleList, Sequential, Softmax 
 from torch.nn.utils.rnn import pad_sequence 
 from transformers import T5ForConditionalGeneration, T5Tokenizer, BartForConditionalGeneration
 from transformers.modeling_utils import PreTrainedModel
@@ -214,6 +214,43 @@ class T5StagedModel(Module):
         lm_logits = self.lm(dec_hidden_states)
         print("LM LOGITS SHAPE", lm_logits.shape)
         return lm_logits, present_key_values 
+
+    def greedy_decode(self, input_ids, attention_mask=None, eos_tok=1): 
+
+        encoder_hidden_states, _, encoder_attn_mask = self.encoder_forward(input_ids=input_ids, 
+                                                                           attention_mask=attention_mask, 
+                                                                           return_attention_mask=True)
+        past_key_values = None
+        targ_ids = torch.zeros((input_ids.shape[0], 1), dtype=torch.long)
+        
+        sequences = None
+
+        while True:
+            lm_logits, past_key_values = self.decoder_forward(target_ids=targ_ids,
+                                                            encoder_hidden_states=encoder_hidden_states,
+                                                            encoder_attention_mask=encoder_attn_mask,
+                                                            past_key_values=past_key_values,
+                                                            cross_attn_head_mask=None)
+
+            probs = Softmax(dim=-1)(lm_logits)
+            tokens = torch.argmax(probs, dim=-1)[:, -1:]
+
+            sequences = tokens if sequences is None else torch.cat([sequences, tokens], dim=1)
+
+            if self.all_eos(tokens, eos_tok):
+                return sequences 
+            targ_ids = tokens
+
+            print(sequences)
+
+
+    
+    def all_eos(self, output_ids: torch.Tensor, eos_tok=1) -> bool:
+        num_eos_toks_in_row = torch.sum(output_ids == eos_tok, dim=-1)
+        does_zero_exist = torch.sum(num_eos_toks_in_row == 0)
+        return does_zero_exist.item() < 1e-6
+
+
     
     def extend_attention_mask_enc(self, mask):
         """
@@ -338,6 +375,9 @@ class T5StagedModel(Module):
 
 
 
+
+
+
 if __name__ == "__main__":
 
 
@@ -345,7 +385,7 @@ if __name__ == "__main__":
     # model = BartForConditionalGeneration.from_pretrained("facebook/bart-large-cnn")
     tok = T5Tokenizer.from_pretrained("t5-base", model_max_length=512)
     
-    tokenized = tok(["test one", "test two three", "testing one", "testing two four"])
+    tokenized = tok(["translate English to German: today is a good day"])
     input_ids = [torch.tensor(t) for t in tokenized["input_ids"]] 
     attention_mask = [torch.tensor(t) for t in tokenized["attention_mask"]]
 
@@ -370,7 +410,15 @@ if __name__ == "__main__":
                                    attention_mask=attention_mask_padded, 
                                    past_key_values=past_key_values)
 
-    
+   
+    all_eos = model.all_eos(torch.tensor([[3, 4, 5, 6, 7, 1, 0, 0], [2, 3, 4, 1, 1, 7, 8, 9], [2, 2, 2, 2, 3, 3, 3, 1]]))
+    print(all_eos)
+
+    output_ids = model.greedy_decode(input_ids_padded, attention_mask_padded)
+    print("OUTPUT_IDS:", output_ids)
+    print(tok.batch_decode(output_ids))
+
+
     # torch.set_printoptions(profile="short")
     # dec = T5ForConditionalGeneration.from_pretrained("t5-base").decoder
     # print(len(dec(input_ids_padded, attention_mask=attention_mask_padded)['past_key_values'][0]))
