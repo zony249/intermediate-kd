@@ -8,6 +8,8 @@ import torch
 
 
 class Env:
+    parser = ArgumentParser(description="Environment Config")
+
     @staticmethod
     def info():
         print("Environment: ")
@@ -15,10 +17,8 @@ class Env:
 
     @staticmethod
     def parse_args():
-        parser = ArgumentParser(description="Environment Config")
-        parser.add_argument("--device", type=str, default=None, help="Device selection. Defaults to the ideal device for your platform")
-
-        args = parser.parse_args()
+        Env.parser.add_argument("--device", type=str, default=None, help="Device selection. Defaults to the ideal device for your platform")
+        args = Env.parser.parse_args()
         
 
 
@@ -35,5 +35,3 @@ class Env:
         setattr(Env, "DEVICE", args.device)
 
 
-Env.parse_args()
-Env.info()

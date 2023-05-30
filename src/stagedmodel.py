@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
-import sys 
+import sys
+from typing import Optional
 
 import torch 
 from torch.nn import Module, ModuleList, Sequential, Softmax 
@@ -15,6 +16,8 @@ XLA_USE_BF16 = os.environ.get("XLA_USE_BF16", "0").upper()
 XLA_DOWNCAST_BF16 = os.environ.get("XLA_DOWNCAST_BF16", "0").upper()
 ENV_VARS_TRUE_VALUES = {"1", "ON", "YES", "TRUE"}
 
+
+
 class T5Stage(Module): 
     def __init__(self, layers: ModuleList):
         super().__init__()
@@ -27,11 +30,11 @@ class T5Stage(Module):
 
     def forward(self, 
                 hidden_states: torch.Tensor, 
-                attention_mask=None, 
-                encoder_hidden_states=None, 
-                encoder_attention_mask=None, 
-                past_key_values=None,
-                cross_attn_head_mask=None):
+                attention_mask: Optional[torch.Tensor] = None, 
+                encoder_hidden_states: Optional[torch.Tensor] = None, 
+                encoder_attention_mask: Optional[torch.Tensor] = None, 
+                past_key_values: Optional[list] = None,
+                cross_attn_head_mask: Optional[torch.Tensor] = None):
 
         present_key_values = [] 
 
@@ -88,25 +91,31 @@ class T5StagedModel(Module):
 
     
     def forward(self, 
-                input_ids, 
-                target_ids=None, 
+                input_ids: torch.Tensor, 
+                target_ids: Optional[torch.Tensor]=None, 
                 attention_mask=None,
                 encoder_hidden_states=None,
                 decoder_attention_mask=None,
                 cross_attn_head_mask=None,
                 past_key_values=None, 
                 return_dict=None, 
-                encoder_return_groups=None, 
-                decoder_return_groups=None):
+                encoder_groups=None, 
+                decoder_groups=None):
+        """
+        Performs a forward pass of the T5 model. If target_ids are not given, then 
+        we assume initial decoder states of zeros. UNLIKE Huggingface's library, 
+        defining target_ids will not give you loss. This function also does not automatically 
+        shift the target_ids right.
+        """
     
         assert self.pre_encoder is not None, "model not initialized, please load a model first using load_t5 (or any other model loading function)"
         
         enc_hidden_states, _, attention_mask = self.encoder_forward(input_ids, 
                                                     attention_mask=attention_mask, 
-                                                    encoder_return_groups=encoder_return_groups, 
+                                                    run_groups=encoder_groups, 
                                                     return_attention_mask=True)
 
-        if encoder_return_groups is not None:
+        if encoder_groups is not None:
             return enc_hidden_states, None
 
         # set target_ids
@@ -120,7 +129,7 @@ class T5StagedModel(Module):
                                                                  encoder_attention_mask=attention_mask,
                                                                  past_key_values=past_key_values,
                                                                  cross_attn_head_mask=cross_attn_head_mask, 
-                                                                 decoder_return_groups=decoder_return_groups)
+                                                                 run_groups=decoder_groups)
 
         return decoder_outputs, present_key_values
 
@@ -128,7 +137,7 @@ class T5StagedModel(Module):
     def encoder_forward(self, 
                         input_ids,
                         attention_mask=None, 
-                        encoder_return_groups=None, 
+                        run_groups=None, 
                         return_attention_mask=False
                         ):
         input_embeds = self.pre_encoder[0](input_ids)
@@ -141,13 +150,17 @@ class T5StagedModel(Module):
 
         # shape is now [batch, None, None, seq_len]
         attention_mask = self.extend_attention_mask_enc(attention_mask)
- 
+
+        if run_groups is None:
+            run_groups = tuple(range(len(self.enc_key_layers)))
+
         # Feed through encoder
-        for i, enc_block in enumerate(self.enc_key_layers): 
-            enc_hidden_states, _ = enc_block(enc_hidden_states, attention_mask=attention_mask)
-            if i == encoder_return_groups:
-                return enc_hidden_states, None
-        enc_hidden_states = self.post_encoder(enc_hidden_states)
+        for i in run_groups: 
+            enc_hidden_states, _ = self.enc_key_layers[i](enc_hidden_states, attention_mask=attention_mask)
+
+        # If we reach the last group, then we also feed through post encoder stages
+        if run_groups[-1] == len(self.enc_key_layers)-1:
+            enc_hidden_states = self.post_encoder(enc_hidden_states)
 
         if return_attention_mask:
             return enc_hidden_states, None, attention_mask 
@@ -160,7 +173,7 @@ class T5StagedModel(Module):
                         encoder_attention_mask=None,
                         past_key_values=None,
                         cross_attn_head_mask=None,
-                        decoder_return_groups=None):
+                        run_groups=None):
 
         target_embeds = self.pre_decoder[0](target_ids)
         batch_size, seq_length = target_ids.shape
@@ -168,7 +181,7 @@ class T5StagedModel(Module):
         # decoder attention mask
         mask_seq_length = past_key_values[0][0].shape[2] + seq_length if past_key_values is not None else seq_length
         if decoder_attention_mask is None:
-            decoder_attention_mask = torch.ones(batch_size, mask_seq_length)
+            decoder_attention_mask = torch.ones(batch_size, mask_seq_length, device=Env.DEVICE)
 
         # shape is now [batch, None, None, seq_len]
         decoder_attention_mask = self.extend_attention_mask_dec(decoder_attention_mask, target_ids.shape) 
@@ -179,9 +192,15 @@ class T5StagedModel(Module):
         pkv_idx = 0
         cross_idx = 0
 
+
+        if run_groups is None:
+            run_groups = tuple(range(len(self.dec_key_layers)))
+
+
         # Feed through decoder
         dec_hidden_states = target_embeds
-        for i, dec_block in enumerate(self.dec_key_layers): 
+        for i in run_groups:
+            dec_block = self.dec_key_layers[i]
             if past_key_values is not None:
                 past_key_value = past_key_values[pkv_idx:pkv_idx+dec_block.size]
                 pkv_idx += dec_block.size
@@ -204,11 +223,12 @@ class T5StagedModel(Module):
                                      past_key_values=past_key_value, 
                                      cross_attn_head_mask=cross_attn_layer_head_mask)
             present_key_values += present_key_value
-            if i == decoder_return_groups:
-                return dec_hidden_states, past_key_values 
 
         print("DECODER HIDDEN STATES SHAPE", dec_hidden_states.shape) 
-        
+
+        # If we dont reach the last group, return early
+        if run_groups[-1] != len(self.dec_key_layers)-1:
+            return dec_hidden_states, present_key_values
         dec_hidden_states = self.post_decoder(dec_hidden_states)
 
         lm_logits = self.lm(dec_hidden_states)
@@ -221,7 +241,7 @@ class T5StagedModel(Module):
                                                                            attention_mask=attention_mask, 
                                                                            return_attention_mask=True)
         past_key_values = None
-        targ_ids = torch.zeros((input_ids.shape[0], 1), dtype=torch.long)
+        targ_ids = torch.zeros((input_ids.shape[0], 1), dtype=torch.long, device=Env.DEVICE)
         
         sequences = None
 
@@ -262,7 +282,10 @@ class T5StagedModel(Module):
         return extended_attention_mask
 
     def extend_attention_mask_dec(self, mask, input_shape):
-        
+        """
+        Taken from https://github.com/huggingface/transformers/blob/v4.29.1/src/transformers/modeling_utils.py#L897
+        -> [num_hidden_layers x batch x num_heads x seq_length x seq_length]
+        """
         batch_size, seq_length = input_shape
         seq_ids = torch.arange(seq_length, device=Env.DEVICE)
         causal_mask = seq_ids[None, None, :].repeat(batch_size, seq_length, 1) <= seq_ids[None, :, None]
@@ -381,7 +404,10 @@ class T5StagedModel(Module):
 if __name__ == "__main__":
 
 
-    model = T5StagedModel.load_t5("t5-base", [3, 5, 7, 9, 12], [3, 5, 7, 9, 12])
+    Env.parse_args()
+    Env.info()
+
+    model = T5StagedModel.load_t5("t5-base", [3, 5, 7, 9, 12], [3, 5, 7, 9, 12]).to(Env.DEVICE)
     # model = BartForConditionalGeneration.from_pretrained("facebook/bart-large-cnn")
     tok = T5Tokenizer.from_pretrained("t5-base", model_max_length=512)
     
@@ -391,8 +417,8 @@ if __name__ == "__main__":
 
     print(input_ids)
 
-    input_ids_padded = pad_sequence(input_ids, batch_first=True, padding_value=0) 
-    attention_mask_padded = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+    input_ids_padded = pad_sequence(input_ids, batch_first=True, padding_value=0).to(Env.DEVICE)
+    attention_mask_padded = pad_sequence(attention_mask, batch_first=True, padding_value=0).to(Env.DEVICE)
 
     
     print(input_ids_padded)
