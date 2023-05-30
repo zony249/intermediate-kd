@@ -89,6 +89,52 @@ class T5StagedModel(Module):
 
         self.lm = None 
 
+    @staticmethod 
+    def load_t5(model_name: str, encoder_staging: list, decoder_staging: list) -> T5StagedModel:
+        model = T5ForConditionalGeneration.from_pretrained(model_name)
+        
+        staged_model = T5StagedModel() 
+
+        pre_encoder = [] 
+        enc_key_layers = []  
+        post_encoder = []
+
+        pre_decoder = []
+        dec_key_layers = []
+        post_decoder = []
+
+
+        # initialize encoder 
+        pre_encoder.append(model.encoder.embed_tokens)
+        prev_staging_idx = 0
+        for idx in encoder_staging:
+            enc_key_layers.append(T5Stage(model.encoder.block[prev_staging_idx:idx]))
+            prev_staging_idx = idx
+        post_encoder.append(model.encoder.final_layer_norm)
+        post_encoder.append(model.encoder.dropout)
+
+
+        # initialize decoder
+        pre_decoder.append(model.decoder.embed_tokens)
+        prev_staging_idx = 0 
+        for idx in decoder_staging:
+            dec_key_layers.append(T5Stage(model.decoder.block[prev_staging_idx:idx]))
+            prev_staging_idx = idx 
+        post_decoder.append(model.decoder.final_layer_norm)
+        post_decoder.append(model.decoder.dropout)
+
+
+        staged_model.pre_encoder = ModuleList(pre_encoder)
+        staged_model.enc_key_layers = ModuleList(enc_key_layers) 
+        staged_model.post_encoder = Sequential(*post_encoder) 
+
+        staged_model.pre_decoder = ModuleList(pre_decoder)
+        staged_model.dec_key_layers = ModuleList(dec_key_layers) 
+        staged_model.post_decoder = Sequential(*post_decoder) 
+
+        staged_model.lm = model.lm_head 
+
+        return staged_model
     
     def forward(self, 
                 input_ids: torch.Tensor, 
@@ -235,7 +281,7 @@ class T5StagedModel(Module):
         print("LM LOGITS SHAPE", lm_logits.shape)
         return lm_logits, present_key_values 
 
-    def greedy_decode(self, input_ids, attention_mask=None, eos_tok=1): 
+    def greedy_decode(self, input_ids, attention_mask=None, eos_tok=1, max_len=100): 
 
         encoder_hidden_states, _, encoder_attn_mask = self.encoder_forward(input_ids=input_ids, 
                                                                            attention_mask=attention_mask, 
@@ -244,7 +290,8 @@ class T5StagedModel(Module):
         targ_ids = torch.zeros((input_ids.shape[0], 1), dtype=torch.long, device=Env.DEVICE)
         
         sequences = None
-
+        
+        idx = 0
         while True:
             lm_logits, past_key_values = self.decoder_forward(target_ids=targ_ids,
                                                             encoder_hidden_states=encoder_hidden_states,
@@ -262,7 +309,9 @@ class T5StagedModel(Module):
             targ_ids = tokens
 
             print(sequences)
-
+            idx += 1 
+            if idx >= max_len:
+                return sequences 
 
     
     def all_eos(self, output_ids: torch.Tensor, eos_tok=1) -> bool:
@@ -348,52 +397,6 @@ class T5StagedModel(Module):
                 return t.dtype
 
 
-    @staticmethod 
-    def load_t5(model_name: str, encoder_staging: list, decoder_staging: list) -> T5StagedModel:
-        model = T5ForConditionalGeneration.from_pretrained(model_name)
-        
-        staged_model = T5StagedModel() 
-
-        pre_encoder = [] 
-        enc_key_layers = []  
-        post_encoder = []
-
-        pre_decoder = []
-        dec_key_layers = []
-        post_decoder = []
-
-
-        # initialize encoder 
-        pre_encoder.append(model.encoder.embed_tokens)
-        prev_staging_idx = 0
-        for idx in encoder_staging:
-            enc_key_layers.append(T5Stage(model.encoder.block[prev_staging_idx:idx]))
-            prev_staging_idx = idx
-        post_encoder.append(model.encoder.final_layer_norm)
-        post_encoder.append(model.encoder.dropout)
-
-
-        # initialize decoder
-        pre_decoder.append(model.decoder.embed_tokens)
-        prev_staging_idx = 0 
-        for idx in decoder_staging:
-            dec_key_layers.append(T5Stage(model.decoder.block[prev_staging_idx:idx]))
-            prev_staging_idx = idx 
-        post_decoder.append(model.decoder.final_layer_norm)
-        post_decoder.append(model.decoder.dropout)
-
-
-        staged_model.pre_encoder = ModuleList(pre_encoder)
-        staged_model.enc_key_layers = ModuleList(enc_key_layers) 
-        staged_model.post_encoder = Sequential(*post_encoder) 
-
-        staged_model.pre_decoder = ModuleList(pre_decoder)
-        staged_model.dec_key_layers = ModuleList(dec_key_layers) 
-        staged_model.post_decoder = Sequential(*post_decoder) 
-
-        staged_model.lm = model.lm_head 
-
-        return staged_model
 
 
 
@@ -411,7 +414,7 @@ if __name__ == "__main__":
     # model = BartForConditionalGeneration.from_pretrained("facebook/bart-large-cnn")
     tok = T5Tokenizer.from_pretrained("t5-base", model_max_length=512)
     
-    tokenized = tok(["translate English to German: today is a good day"])
+    tokenized = tok(["translate English to German: Today is a good day."])
     input_ids = [torch.tensor(t) for t in tokenized["input_ids"]] 
     attention_mask = [torch.tensor(t) for t in tokenized["attention_mask"]]
 
@@ -425,16 +428,16 @@ if __name__ == "__main__":
     print(attention_mask_padded) 
 
 
-    _, past_key_values = model(input_ids=input_ids_padded, 
-                               target_ids=input_ids_padded, 
-                               attention_mask=attention_mask_padded)
-    print("PAST KEY VALUES", past_key_values[0][0].shape)
-    
-    for i in range(10):
-        _, past_key_values = model(input_ids=input_ids_padded, 
-                                   target_ids=input_ids_padded, 
-                                   attention_mask=attention_mask_padded, 
-                                   past_key_values=past_key_values)
+    # _, past_key_values = model(input_ids=input_ids_padded, 
+    #                            target_ids=input_ids_padded, 
+    #                            attention_mask=attention_mask_padded)
+    # print("PAST KEY VALUES", past_key_values[0][0].shape)
+    # 
+    # for i in range(10):
+    #     _, past_key_values = model(input_ids=input_ids_padded, 
+    #                                target_ids=input_ids_padded, 
+    #                                attention_mask=attention_mask_padded, 
+    #                                past_key_values=past_key_values)
 
    
     all_eos = model.all_eos(torch.tensor([[3, 4, 5, 6, 7, 1, 0, 0], [2, 3, 4, 1, 1, 7, 8, 9], [2, 2, 2, 2, 3, 3, 3, 1]]))
