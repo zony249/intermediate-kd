@@ -1,5 +1,3 @@
-
-
 import os 
 import sys
 
@@ -16,6 +14,7 @@ from env import Env
 from utils import mkdir
 from stagedmodel import T5StagedModel
 from datasets import WMT14
+from preprocess import preprocess_wmt14 
 
 
 END_LAYER = 100
@@ -174,6 +173,10 @@ if __name__ == "__main__":
     Env.add_train_args()
     Env.parse_args()
     Env.info()
+
+    
+
+
 
     tokenizer = T5Tokenizer.from_pretrained("t5-base")
     model = T5StagedModel.load_t5("t5-base", [2, 4, 6, 8, 10, END_LAYER], [2, 4, 6, 8, 10, END_LAYER]).to(Env.DEVICE) 
