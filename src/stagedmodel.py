@@ -287,7 +287,7 @@ class T5StagedModel(Module):
                                                                            attention_mask=attention_mask, 
                                                                            return_attention_mask=True)
         past_key_values = None
-        targ_ids = torch.zeros((input_ids.shape[0], 1), dtype=torch.long, device=Env.DEVICE)
+        targ_ids = torch.zeros((input_ids.shape[0], 1), dtype=torch.int, device=Env.DEVICE)
         
         sequences = None
         
@@ -308,7 +308,7 @@ class T5StagedModel(Module):
                 return sequences 
             targ_ids = tokens
 
-            print(sequences)
+            print("SEQUENCES:", sequences)
             idx += 1 
             if idx >= max_len:
                 return sequences 
