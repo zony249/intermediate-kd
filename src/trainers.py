@@ -182,7 +182,7 @@ if __name__ == "__main__":
 
 
     trainer = SingleModelTrainer(model, tset=tset)
-    trainer.train(lossfn=None, optim=None, epochs=None, batch_size=16, lr=1e-4, log_interval=50, save_interval=100, metrics=[])
+    trainer.train(lossfn=None, optim=None, epochs=None, batch_size=16, lr=1e-4, log_interval=50, save_interval=1000, metrics=[])
     
 
 
