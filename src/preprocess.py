@@ -74,6 +74,7 @@ if __name__ == "__main__":
     
     Env.add_train_args()
     Env.parse_args()
+    Env.info()
 
     
     tok = T5TokenizerFast.from_pretrained("t5-base") 

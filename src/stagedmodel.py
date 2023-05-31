@@ -17,6 +17,8 @@ XLA_DOWNCAST_BF16 = os.environ.get("XLA_DOWNCAST_BF16", "0").upper()
 ENV_VARS_TRUE_VALUES = {"1", "ON", "YES", "TRUE"}
 
 
+debug=False
+
 
 class T5Stage(Module): 
     def __init__(self, layers: ModuleList):
@@ -39,14 +41,15 @@ class T5Stage(Module):
         present_key_values = [] 
 
         for i, layer in enumerate(self.layers):
-            print("DECODER:", layer.is_decoder, ", I", i)
+            if debug:
+                print("DECODER:", layer.is_decoder, ", I", i)
 
             # past key value 
             if past_key_values is None:
                 past_key_value = None
             else:
                 past_key_value = past_key_values[i]
-                if past_key_value is not None:
+                if past_key_value is not None and debug:
                     print("HIDDEN STATES SHAPE", hidden_states.shape)
                     print("PAST KEY VALUE:",  past_key_value[:2][0].shape)
             
@@ -187,7 +190,8 @@ class T5StagedModel(Module):
                         return_attention_mask=False
                         ):
         input_embeds = self.pre_encoder[0](input_ids)
-        print(input_embeds.shape) 
+        if debug:
+            print(input_embeds.shape) 
 
         enc_hidden_states = input_embeds
        
@@ -260,7 +264,8 @@ class T5StagedModel(Module):
             else:
                 cross_attn_layer_head_mask = [None] * dec_block.size
             
-            print("DECODER ATTENTION MASK SHAPE:", decoder_attention_mask.shape)
+            if debug:
+                print("DECODER ATTENTION MASK SHAPE:", decoder_attention_mask.shape)
 
             dec_hidden_states, present_key_value = dec_block(dec_hidden_states, 
                                      attention_mask=decoder_attention_mask, 
@@ -269,8 +274,9 @@ class T5StagedModel(Module):
                                      past_key_values=past_key_value, 
                                      cross_attn_head_mask=cross_attn_layer_head_mask)
             present_key_values += present_key_value
-
-        print("DECODER HIDDEN STATES SHAPE", dec_hidden_states.shape) 
+        
+        if debug:
+            print("DECODER HIDDEN STATES SHAPE", dec_hidden_states.shape) 
 
         # If we dont reach the last group, return early
         if run_groups[-1] != len(self.dec_key_layers)-1:
@@ -278,7 +284,8 @@ class T5StagedModel(Module):
         dec_hidden_states = self.post_decoder(dec_hidden_states)
 
         lm_logits = self.lm(dec_hidden_states)
-        print("LM LOGITS SHAPE", lm_logits.shape)
+        if debug:
+            print("LM LOGITS SHAPE", lm_logits.shape)
         return lm_logits, present_key_values 
 
     def greedy_decode(self, input_ids, attention_mask=None, eos_tok=1, max_len=100): 
@@ -308,7 +315,8 @@ class T5StagedModel(Module):
                 return sequences 
             targ_ids = tokens
 
-            print("SEQUENCES:", sequences)
+            if debug:
+                print("SEQUENCES:", sequences)
             idx += 1 
             if idx >= max_len:
                 return sequences 
