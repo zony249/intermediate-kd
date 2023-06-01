@@ -52,3 +52,4 @@ class Env:
         Env.parser.add_argument("--batch_size", type=int, default=12, help="Learning rate")
         Env.parser.add_argument("--optim", type=str, default="adamw", help="Optimizer")
         Env.parser.add_argument("--data", type=str, default="wmt16", help="Which dataset to train on. Currently supports wmt14, wmt16")
+        Env.parser.add_argument("--max_len", type=int, default=256, help="Max sequence length")
